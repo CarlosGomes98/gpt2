@@ -235,8 +235,9 @@ if __name__ == "__main__":
     cfg = GPT_NANO_CONFIG
     model = GPTModel(cfg).to(device)
     model = torch.compile(model)
-    batch_size = 16
-    grad_acc_steps = 16
+    # train params
+    batch_size = 64
+    grad_acc_steps = 1
     warmup_steps = 32
     epochs = 10
     max_lr = 3e-4
@@ -250,7 +251,7 @@ if __name__ == "__main__":
 
     max_steps = epochs * (len(dataset.tokens) // (cfg.block_size * batch_size * grad_acc_steps * world_size))
 
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=None, batch_sampler=None, num_workers=4, worker_init_fn=worker_init_fn)
+    dataloader = torch.utils.data.DataLoader(dataset, persistent_workers=True, batch_size=None, batch_sampler=None, num_workers=4, worker_init_fn=worker_init_fn)
     scaler = torch.cuda.amp.GradScaler()
 
     def get_lr(it):
@@ -268,7 +269,8 @@ if __name__ == "__main__":
 
     step = 0
     for epoch in range(epochs):
-        print(f"==== Epoch {epoch} ====")
+        if master_process:
+            print(f"==== Epoch {epoch} ====")
         total_loss = 0.0
         for index, (x, y) in enumerate(dataloader):
             if index % grad_acc_steps == 0: # first micro batch
@@ -302,7 +304,8 @@ if __name__ == "__main__":
                 tokens_processed = dataset.batch_size * dataset.seq_len * world_size * grad_acc_steps
                 tokens_per_sec = tokens_processed / dt
 
-                print(f"Batch {index // grad_acc_steps} ({grad_acc_steps}) | Loss {total_loss:.4f} | lr {lr:.4e} | norm: {norm:.4f} | dt {dt*1000:.2f} ms | Rate {tokens_per_sec:.2f} tok/sec")
+                if master_process:
+                    print(f"Batch {index // grad_acc_steps} ({grad_acc_steps}) | Loss {total_loss:.4f} | lr {lr:.4e} | norm: {norm:.4f} | dt {dt*1000:.2f} ms | Rate {tokens_per_sec:.2f} tok/sec")
                 total_loss = 0.0
                 optimizer.zero_grad()
     if ddp:
