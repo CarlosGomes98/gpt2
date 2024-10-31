@@ -205,6 +205,11 @@ class GPTModel(nn.Module):
 
 GPT_NANO_CONFIG = GPTConfig(vocab_size=50304, n_embed=768, block_size=1024, n_layer=4, n_head=4)
 
+def worker_init_fn(worker_id):
+    worker_info = torch.utils.data.get_worker_info()
+    dataset: ShakespeareDataset = worker_info.dataset  # the dataset copy in this worker process
+    dataset.position = dataset.batch_size * dataset.seq_len * worker_info.num_workers * dataset.rank + dataset.batch_size * dataset.seq_len * worker_info.id
+    dataset.increment = worker_info.num_workers * dataset.increment
 
 #######
 
@@ -244,11 +249,6 @@ if __name__ == "__main__":
     dataset = ShakespeareDataset("input.txt", batch_size=batch_size, seq_len=cfg.block_size, world_size=world_size, rank=rank)
 
     max_steps = epochs * (len(dataset.tokens) // (cfg.block_size * batch_size * grad_acc_steps * world_size))
-    def worker_init_fn(worker_id):
-        worker_info = torch.utils.data.get_worker_info()
-        dataset: ShakespeareDataset = worker_info.dataset  # the dataset copy in this worker process
-        dataset.position = dataset.batch_size * dataset.seq_len * worker_info.num_workers * dataset.rank + dataset.batch_size * dataset.seq_len * worker_info.id
-        dataset.increment = worker_info.num_workers * dataset.increment
 
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=None, batch_sampler=None, num_workers=4, worker_init_fn=worker_init_fn)
     scaler = torch.cuda.amp.GradScaler()
