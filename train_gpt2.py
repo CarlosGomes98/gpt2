@@ -232,7 +232,7 @@ if __name__ == "__main__":
     # train params
     num_workers = 4
     batch_size = 16
-    grad_acc_steps = 4
+    grad_acc_steps = 1
     warmup_steps = 32
     epochs = 20
     max_lr = 3e-4
