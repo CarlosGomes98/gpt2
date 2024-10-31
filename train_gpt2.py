@@ -8,6 +8,7 @@ import tiktoken
 from torch import nn
 import torch.nn.functional as F
 from einops import rearrange
+import os
 
 class ShakespeareDataset(IterableDataset):
     def __init__(self, path, *, batch_size, seq_len, world_size, rank):
@@ -23,9 +24,6 @@ class ShakespeareDataset(IterableDataset):
 
         self.position = batch_size * seq_len * rank
         self.increment = batch_size * seq_len * world_size
-        
-        if rank == 0:
-            print(f"1 epoch = {len(self.tokens) // (self.batch_size * self.seq_len)} batches")
     
     def __iter__(self):
         position = self.position
@@ -75,10 +73,12 @@ class Attention(nn.Module):
         k = rearrange(k, "B T (heads e) -> B heads T e", B=B, T=T, heads=self.n_heads)
         v = rearrange(v, "B T (heads e) -> B heads T e", B=B, T=T, heads=self.n_heads)
         # do attention
-        logits = q @ k.transpose(-2, -1) * (1.0 / math.sqrt(k.size(-1)))
-        logits = logits.masked_fill(self.bias[..., :T, :T] == 0, -torch.inf)
-        weights = F.softmax(logits, dim=-1)
-        v = weights @ v
+        # logits = q @ k.transpose(-2, -1) * (1.0 / math.sqrt(k.size(-1)))
+        # logits = logits.masked_fill(self.bias[..., :T, :T] == 0, -torch.inf)
+        # weights = F.softmax(logits, dim=-1)
+        # v = weights @ v
+
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
         # B heads T e -> B T heads*e
         v = rearrange(v, "B heads T e -> B T (heads e)", B=B, T=T, heads=self.n_heads)
         return self.c_proj(v)
@@ -203,50 +203,110 @@ class GPTModel(nn.Module):
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
         return Output(logits, loss)
 
-GPT_NANO_CONFIG = GPTConfig(vocab_size=50257, n_embed=128, block_size=128, n_layer=4, n_head=4)
+GPT_NANO_CONFIG = GPTConfig(vocab_size=50304, n_embed=768, block_size=1024, n_layer=4, n_head=4)
+
+
 #######
 
 if __name__ == "__main__":
+    torch.set_float32_matmul_precision("high")
+    ddp = "RANK" in os.environ
 
-    device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
+    if ddp:
+        torch.distributed.init_process_group()
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        torch.cuda.set_device(rank)
+        device = int(rank)
+        master_process = rank == 0
+    else:
+        rank = 0
+        world_size = 1
+        master_process = True
+        device = rank
 
     torch.manual_seed(42)
+    # model = GPTModel.from_pretrained("gpt2")
     cfg = GPT_NANO_CONFIG
     model = GPTModel(cfg).to(device)
-    # model = GPTModel.from_pretrained("gpt2")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-    dataset = ShakespeareDataset("input.txt", batch_size=4, seq_len=cfg.block_size, world_size=1, rank=0)
+    model = torch.compile(model)
+    batch_size = 16
+    grad_acc_steps = 16
+    warmup_steps = 32
+    epochs = 10
+    max_lr = 3e-4
+    min_lr = 0.1*max_lr
 
+    if ddp:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device])
+    raw_model = model if not ddp else model.module
+    optimizer = torch.optim.AdamW(raw_model.parameters(), lr=3e-4, fused=True)
+    dataset = ShakespeareDataset("input.txt", batch_size=batch_size, seq_len=cfg.block_size, world_size=world_size, rank=rank)
+
+    max_steps = epochs * (len(dataset.tokens) // (cfg.block_size * batch_size * grad_acc_steps * world_size))
     def worker_init_fn(worker_id):
         worker_info = torch.utils.data.get_worker_info()
         dataset: ShakespeareDataset = worker_info.dataset  # the dataset copy in this worker process
         dataset.position = dataset.batch_size * dataset.seq_len * worker_info.num_workers * dataset.rank + dataset.batch_size * dataset.seq_len * worker_info.id
         dataset.increment = worker_info.num_workers * dataset.increment
 
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=None, batch_sampler=None, num_workers=2, worker_init_fn=worker_init_fn)
-    
-    for epoch in range(10):
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=None, batch_sampler=None, num_workers=4, worker_init_fn=worker_init_fn)
+    scaler = torch.cuda.amp.GradScaler()
+
+    def get_lr(it):
+        # 1) linear warmup for warmup_iters steps
+        if it < warmup_steps:
+            return max_lr * (it+1) / warmup_steps
+        # 2) if it > lr_decay_iters, return min learning rate
+        if it > max_steps:
+            return min_lr
+        # 3) in between, use cosine decay down to min learning rate
+        decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+        return min_lr + coeff * (max_lr - min_lr)
+
+    step = 0
+    for epoch in range(epochs):
         print(f"==== Epoch {epoch} ====")
+        total_loss = 0.0
         for index, (x, y) in enumerate(dataloader):
+            if index % grad_acc_steps == 0: # first micro batch
+                t0 = time.time()   
             x, y = x.to(device), y.to(device)
-            t0 = time.time()
-            optimizer.zero_grad()
-            output, loss = model(x, labels=y)
-            loss.backward()
-            optimizer.step()
+            with torch.cuda.amp.autocast():
+                output, loss = model(x, labels=y)
+                loss = loss / grad_acc_steps
+                total_loss += loss.detach()
+            if ddp:
+                model.require_backward_grad_sync = (index + 1) % grad_acc_steps == 0
+            scaler.scale(loss).backward()
+            
+            if (index + 1) % grad_acc_steps == 0: # final micro batch
+                if ddp:
+                    torch.distributed.all_reduce(total_loss, op=torch.distributed.ReduceOp.AVG)
+                scaler.unscale_(optimizer)
+                norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                # determine and set the learning rate for this iteration
+                lr = get_lr(step)
+                step += 1
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = lr
+                scaler.step(optimizer)
+                scaler.update()
 
-            if device == "cuda":
-                torch.cuda.synchronize()
-            t1 = time.time()
-            dt = t1 - t0 # time difference in seconds
-            tokens_processed = dataset.batch_size * dataset.seq_len
-            tokens_per_sec = tokens_processed / dt
+                if device == "cuda":
+                    torch.cuda.synchronize()
+                t1 = time.time()
+                dt = t1 - t0 # time difference in seconds
+                tokens_processed = dataset.batch_size * dataset.seq_len * world_size * grad_acc_steps
+                tokens_per_sec = tokens_processed / dt
 
-            print(f"Batch {index} | Loss {loss.item():.4f} | Rate {tokens_per_sec} tok/sec")
-
-
+                print(f"Batch {index // grad_acc_steps} ({grad_acc_steps}) | Loss {total_loss:.4f} | lr {lr:.4e} | norm: {norm:.4f} | dt {dt*1000:.2f} ms | Rate {tokens_per_sec:.2f} tok/sec")
+                total_loss = 0.0
+                optimizer.zero_grad()
+    if ddp:
+        torch.distributed.destroy_process_group()
     import sys; sys.exit(0)
 
     encoder = tiktoken.get_encoding("gpt2")
