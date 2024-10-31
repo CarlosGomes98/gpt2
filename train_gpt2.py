@@ -226,12 +226,12 @@ if __name__ == "__main__":
 
     torch.manual_seed(42)
     # model = GPTModel.from_pretrained("gpt2")
-    cfg = GPT_NANO_CONFIG
+    cfg = GPT_CONFIG
     model = GPTModel(cfg).to(device)
     model = torch.compile(model)
     # train params
-    num_workers = 2
-    batch_size = 2
+    num_workers = 4
+    batch_size = 16
     grad_acc_steps = 4
     warmup_steps = 32
     epochs = 20
@@ -243,13 +243,13 @@ if __name__ == "__main__":
     raw_model = model if not ddp else model.module
     optimizer = torch.optim.AdamW(raw_model.parameters(), lr=3e-4, fused=True)
     dataset = ShakespeareDataset("input.txt", seq_len=cfg.block_size)
-
+    print(f"{len(dataset) // (batch_size * grad_acc_steps * world_size)} steps per epoch")
     max_steps = epochs * (len(dataset) // (batch_size * grad_acc_steps * world_size))
 
     if ddp:
-        dataloader = torch.utils.data.DataLoader(dataset, shuffle=False, persistent_workers=True, batch_size=batch_size, num_workers=num_workers, pin_memory=True, sampler=DistributedSampler(dataset, num_replicas=world_size, rank=rank))
+        dataloader = torch.utils.data.DataLoader(dataset, shuffle=False, persistent_workers=num_workers>0, batch_size=batch_size, num_workers=num_workers, pin_memory=True, sampler=DistributedSampler(dataset, num_replicas=world_size, rank=rank))
     else:
-        dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, persistent_workers=True, batch_size=batch_size, num_workers=num_workers, pin_memory=True)
+        dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, persistent_workers=num_workers>0, batch_size=batch_size, num_workers=num_workers, pin_memory=True)
     
     scaler = torch.amp.GradScaler()
 
