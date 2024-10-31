@@ -27,7 +27,7 @@ class ShakespeareDataset(IterableDataset):
     
     def __iter__(self):
         position = self.position
-        while position + self.seq_len * self.batch_size + 1 <= len(self.tokens):
+        while position + self.seq_len * self.batch_size + 1 < len(self.tokens):
             # yield
             tokens = self.tokens[position:position + self.seq_len * self.batch_size + 1]
             x = tokens[:-1].view(self.batch_size, self.seq_len)
@@ -203,7 +203,7 @@ class GPTModel(nn.Module):
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
         return Output(logits, loss)
 
-GPT_NANO_CONFIG = GPTConfig(vocab_size=50304, n_embed=768, block_size=1024, n_layer=4, n_head=4)
+GPT_NANO_CONFIG = GPTConfig(vocab_size=50304, n_embed=768, block_size=1024, n_layer=12, n_head=12)
 
 def worker_init_fn(worker_id):
     worker_info = torch.utils.data.get_worker_info()
@@ -219,10 +219,10 @@ if __name__ == "__main__":
 
     if ddp:
         torch.distributed.init_process_group()
-        rank = int(os.environ["RANK"])
+        rank = int(os.environ["LOCAL_RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
         torch.cuda.set_device(rank)
-        device = int(rank)
+        device = rank
         master_process = rank == 0
     else:
         rank = 0
@@ -236,10 +236,10 @@ if __name__ == "__main__":
     model = GPTModel(cfg).to(device)
     model = torch.compile(model)
     # train params
-    batch_size = 64
+    batch_size = 16
     grad_acc_steps = 1
     warmup_steps = 32
-    epochs = 10
+    epochs = 20
     max_lr = 3e-4
     min_lr = 0.1*max_lr
 
@@ -251,7 +251,7 @@ if __name__ == "__main__":
 
     max_steps = epochs * (len(dataset.tokens) // (cfg.block_size * batch_size * grad_acc_steps * world_size))
 
-    dataloader = torch.utils.data.DataLoader(dataset, persistent_workers=True, batch_size=None, batch_sampler=None, num_workers=4, worker_init_fn=worker_init_fn)
+    dataloader = torch.utils.data.DataLoader(dataset, persistent_workers=False, batch_size=None, batch_sampler=None, num_workers=0, worker_init_fn=worker_init_fn)
     scaler = torch.cuda.amp.GradScaler()
 
     def get_lr(it):
@@ -280,13 +280,13 @@ if __name__ == "__main__":
                 output, loss = model(x, labels=y)
                 loss = loss / grad_acc_steps
                 total_loss += loss.detach()
-            if ddp:
-                model.require_backward_grad_sync = (index + 1) % grad_acc_steps == 0
+            # if ddp:
+            #     model.require_backward_grad_sync = (index + 1) % grad_acc_steps == 0
             scaler.scale(loss).backward()
             
             if (index + 1) % grad_acc_steps == 0: # final micro batch
-                if ddp:
-                    torch.distributed.all_reduce(total_loss, op=torch.distributed.ReduceOp.AVG)
+                # if ddp:
+                #     torch.distributed.all_reduce(total_loss, op=torch.distributed.ReduceOp.AVG)
                 scaler.unscale_(optimizer)
                 norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 # determine and set the learning rate for this iteration
@@ -297,15 +297,15 @@ if __name__ == "__main__":
                 scaler.step(optimizer)
                 scaler.update()
 
-                if device == "cuda":
-                    torch.cuda.synchronize()
+                # if device == "cuda":
+                #     torch.cuda.synchronize()
                 t1 = time.time()
                 dt = t1 - t0 # time difference in seconds
                 tokens_processed = dataset.batch_size * dataset.seq_len * world_size * grad_acc_steps
                 tokens_per_sec = tokens_processed / dt
 
-                if master_process:
-                    print(f"Batch {index // grad_acc_steps} ({grad_acc_steps}) | Loss {total_loss:.4f} | lr {lr:.4e} | norm: {norm:.4f} | dt {dt*1000:.2f} ms | Rate {tokens_per_sec:.2f} tok/sec")
+                # if master_process:
+                #     print(f"Batch {index // grad_acc_steps} ({grad_acc_steps}) | Loss {total_loss:.4f} | lr {lr:.4e} | norm: {norm:.4f} | dt {dt*1000:.2f} ms | Rate {tokens_per_sec:.2f} tok/sec")
                 total_loss = 0.0
                 optimizer.zero_grad()
     if ddp:
