@@ -3,37 +3,34 @@ from dataclasses import dataclass
 import math
 import time
 import torch
-from torch.utils.data import IterableDataset
+from torch.utils.data import Dataset
+from torch.utils.data.distributed import DistributedSampler
 import tiktoken
 from torch import nn
 import torch.nn.functional as F
 from einops import rearrange
 import os
 
-class ShakespeareDataset(IterableDataset):
-    def __init__(self, path, *, batch_size, seq_len, world_size, rank):
+class ShakespeareDataset(Dataset):
+    def __init__(self, path, *, seq_len):
         with open(path, "r") as f:
             data = f.read()
         self.seq_len = seq_len
-        self.batch_size = batch_size
-        self.rank = rank
-        self.world_size = world_size
         enc = tiktoken.get_encoding('gpt2')
         tokens = enc.encode(data)
         self.tokens = torch.tensor(tokens)
+        # throw away those that dont fit
+        self.tokens = self.tokens[:-(len(self.tokens) % seq_len) + 1]
 
-        self.position = batch_size * seq_len * rank
-        self.increment = batch_size * seq_len * world_size
+    def __len__(self):
+        return (len(self.tokens) - 1) // self.seq_len
     
-    def __iter__(self):
-        position = self.position
-        while position + self.seq_len * self.batch_size + 1 < len(self.tokens):
-            # yield
-            tokens = self.tokens[position:position + self.seq_len * self.batch_size + 1]
-            x = tokens[:-1].view(self.batch_size, self.seq_len)
-            y = tokens[1:].view(self.batch_size, self.seq_len)
-            yield x, y
-            position += self.increment
+    def __getitem__(self, idx):
+        position = idx * self.seq_len
+        tokens = self.tokens[position:position + self.seq_len + 1]
+        x = tokens[:-1]
+        y = tokens[1:]
+        return x, y
 
 ##########################
 class MLP(nn.Module):
@@ -203,13 +200,8 @@ class GPTModel(nn.Module):
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
         return Output(logits, loss)
 
-GPT_NANO_CONFIG = GPTConfig(vocab_size=50304, n_embed=768, block_size=1024, n_layer=12, n_head=12)
-
-def worker_init_fn(worker_id):
-    worker_info = torch.utils.data.get_worker_info()
-    dataset: ShakespeareDataset = worker_info.dataset  # the dataset copy in this worker process
-    dataset.position = dataset.batch_size * dataset.seq_len * worker_info.num_workers * dataset.rank + dataset.batch_size * dataset.seq_len * worker_info.id
-    dataset.increment = worker_info.num_workers * dataset.increment
+GPT_CONFIG = GPTConfig(vocab_size=50304, n_embed=768, block_size=1024, n_layer=12, n_head=12)
+GPT_NANO_CONFIG = GPTConfig(vocab_size=50304, n_embed=64, block_size=64, n_layer=2, n_head=2)
 
 #######
 
@@ -219,16 +211,18 @@ if __name__ == "__main__":
 
     if ddp:
         torch.distributed.init_process_group()
-        rank = int(os.environ["LOCAL_RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
         torch.cuda.set_device(rank)
-        device = rank
+        device = rank % torch.cuda.device_count()
         master_process = rank == 0
+        amp_device = "cuda"
     else:
         rank = 0
         world_size = 1
         master_process = True
-        device = rank
+        device = rank if torch.cuda.is_available() else "cpu"
+        amp_device = "cpu" if device == "cpu" else "cuda"
 
     torch.manual_seed(42)
     # model = GPTModel.from_pretrained("gpt2")
@@ -236,8 +230,9 @@ if __name__ == "__main__":
     model = GPTModel(cfg).to(device)
     model = torch.compile(model)
     # train params
-    batch_size = 16
-    grad_acc_steps = 1
+    num_workers = 2
+    batch_size = 2
+    grad_acc_steps = 4
     warmup_steps = 32
     epochs = 20
     max_lr = 3e-4
@@ -247,12 +242,16 @@ if __name__ == "__main__":
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device])
     raw_model = model if not ddp else model.module
     optimizer = torch.optim.AdamW(raw_model.parameters(), lr=3e-4, fused=True)
-    dataset = ShakespeareDataset("input.txt", batch_size=batch_size, seq_len=cfg.block_size, world_size=world_size, rank=rank)
+    dataset = ShakespeareDataset("input.txt", seq_len=cfg.block_size)
 
-    max_steps = epochs * (len(dataset.tokens) // (cfg.block_size * batch_size * grad_acc_steps * world_size))
+    max_steps = epochs * (len(dataset) // (batch_size * grad_acc_steps * world_size))
 
-    dataloader = torch.utils.data.DataLoader(dataset, persistent_workers=False, batch_size=None, batch_sampler=None, num_workers=0, worker_init_fn=worker_init_fn)
-    scaler = torch.cuda.amp.GradScaler()
+    if ddp:
+        dataloader = torch.utils.data.DataLoader(dataset, shuffle=False, persistent_workers=True, batch_size=batch_size, num_workers=num_workers, pin_memory=True, sampler=DistributedSampler(dataset, num_replicas=world_size, rank=rank))
+    else:
+        dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, persistent_workers=True, batch_size=batch_size, num_workers=num_workers, pin_memory=True)
+    
+    scaler = torch.amp.GradScaler()
 
     def get_lr(it):
         # 1) linear warmup for warmup_iters steps
@@ -271,22 +270,25 @@ if __name__ == "__main__":
     for epoch in range(epochs):
         if master_process:
             print(f"==== Epoch {epoch} ====")
+        if ddp:
+            dataloader.sampler.set_epoch(epoch)
         total_loss = 0.0
+        optimizer.zero_grad()
         for index, (x, y) in enumerate(dataloader):
             if index % grad_acc_steps == 0: # first micro batch
                 t0 = time.time()   
             x, y = x.to(device), y.to(device)
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast(amp_device):
                 output, loss = model(x, labels=y)
                 loss = loss / grad_acc_steps
                 total_loss += loss.detach()
-            # if ddp:
-            #     model.require_backward_grad_sync = (index + 1) % grad_acc_steps == 0
+            if ddp:
+                model.require_backward_grad_sync = (index + 1) % grad_acc_steps == 0
             scaler.scale(loss).backward()
             
             if (index + 1) % grad_acc_steps == 0: # final micro batch
-                # if ddp:
-                #     torch.distributed.all_reduce(total_loss, op=torch.distributed.ReduceOp.AVG)
+                if ddp:
+                    torch.distributed.all_reduce(total_loss, op=torch.distributed.ReduceOp.AVG)
                 scaler.unscale_(optimizer)
                 norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 # determine and set the learning rate for this iteration
@@ -297,15 +299,15 @@ if __name__ == "__main__":
                 scaler.step(optimizer)
                 scaler.update()
 
-                # if device == "cuda":
-                #     torch.cuda.synchronize()
+                if amp_device == "cuda":
+                    torch.cuda.synchronize()
                 t1 = time.time()
                 dt = t1 - t0 # time difference in seconds
-                tokens_processed = dataset.batch_size * dataset.seq_len * world_size * grad_acc_steps
+                tokens_processed = batch_size * dataset.seq_len * world_size * grad_acc_steps
                 tokens_per_sec = tokens_processed / dt
 
-                # if master_process:
-                #     print(f"Batch {index // grad_acc_steps} ({grad_acc_steps}) | Loss {total_loss:.4f} | lr {lr:.4e} | norm: {norm:.4f} | dt {dt*1000:.2f} ms | Rate {tokens_per_sec:.2f} tok/sec")
+                if master_process:
+                    print(f"Batch {index // grad_acc_steps} ({grad_acc_steps}) | Loss {total_loss:.4f} | lr {lr:.4e} | norm: {norm:.4f} | dt {dt*1000:.2f} ms | Rate {tokens_per_sec:.2f} tok/sec")
                 total_loss = 0.0
                 optimizer.zero_grad()
     if ddp:
